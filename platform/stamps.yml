@@ -1,0 +1,32 @@
+# Platform-team owned. Tenants declare `protocol` + `stamps`; everything below is resolved here.
+stamps:
+  us:
+    default_backends:
+      pulsar: [pulsar-4x]
+      kafka: [msk-3x]
+    backends:
+      pulsar-4x:
+        protocol: pulsar
+        clusters:
+          dev:   { us-east-2: { admin_url: "https://pulsar-dev-use2.example", audience: "..." } }
+          prod:
+            us-east-2: { admin_url: "https://pulsar-prod-use2.example", audience: "..." }
+            us-west-2: { admin_url: "https://pulsar-prod-usw2.example", audience: "..." }
+      msk-3x:
+        protocol: kafka
+        clusters:
+          dev:   { us-east-2: { bootstrap: "b-1.msk-dev.example:9098", schema_registry: "https://sr-dev.example" } }
+          prod:  { us-east-2: { bootstrap: "b-1.msk-prod.example:9098", schema_registry: "https://sr-prod.example" } }
+  eu:
+    default_backends:
+      pulsar: [pulsar-4x]
+      kafka: [eventhubs-kafka]   # same protocol, different vendor — invisible to tenants
+    backends:
+      pulsar-4x:
+        protocol: pulsar
+        clusters:
+          prod: { eu-central-1: { admin_url: "https://pulsar-prod-euc1.example", audience: "..." } }
+      eventhubs-kafka:
+        protocol: kafka
+        clusters:
+          prod: { westeurope: { bootstrap: "ns-eu.servicebus.windows.net:9093" } }

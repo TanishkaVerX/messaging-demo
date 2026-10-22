@@ -3,32 +3,36 @@
 Sandbox for trying out the repository structure proposed in
 [`roadmap-new-repo-eu-priority.md`](https://github.com/vertexinc/gala-pulsar-env-deployment/blob/develop/docs/roadmap-new-repo-eu-priority.md)
 for `vcp-messaging-resources` — a backend-agnostic, single-branch repo for provisioning
-messaging resources (tenants, namespaces, topics, subscriptions, permissions) across stamps.
+messaging resources (tenants, namespaces, topics, subscriptions, permissions) across stamps,
+on **any** messaging platform (Pulsar today; Kafka, Event Hubs, etc. as teams adopt them).
 
 ## Structure
 
 ```
 messaging-demo/
 ├── platform/                  # Platform-team owned (CODEOWNERS-protected)
-│   ├── stamps.yml             # stamp (us, eu) → backend (pulsar-4x, ...) → clusters per env/cloud region
+│   ├── stamps.yml             # stamp (us, eu) → protocol → backends (pulsar-4x, msk-3x, ...) → clusters
 │   ├── backend-routing.yml    # per-tenant backend overrides during backend migrations
 │   ├── defaults.yml           # org-wide defaults, generated from live cluster state then reviewed
 │   ├── defaults.eu.yml        # EU-specific overrides
 │   └── geo-replication-exceptions.yml
 ├── tenants/
-│   └── <tenant>/config.yml    # one file per tenant: owner, contacts, stamps, client IDs,
+│   └── <tenant>/config.yml    # one file per tenant: owner, contacts, protocol, stamps, client IDs,
 │                              # namespaces, topics, permissions (only deviations from defaults)
 ├── schema/
-│   ├── models.py              # Pydantic models — source of truth for validation
-│   └── tenant-config.schema.json
-├── messaging-deploy/          # CLI: validate, plan, apply, audit, monitors, scaffold-tenant, migrate
+│   ├── models.py              # portable Pydantic models — source of truth for validation
+│   └── tenant-config.schema.json  # generated from models.py
+├── messaging_deploy/          # CLI: validate, plan, apply, audit, monitors, scaffold-tenant, migrate
 │   ├── config/                # load configs, merge defaults, resolve names → client IDs
-│   ├── backends/              # backend interface + Pulsar Admin implementation
-│   ├── engine/                # diff (desired vs live), plan, apply
+│   ├── backends/              # one adapter per protocol, all implementing backends/base.py
+│   │   ├── base.py            # Backend interface + capability model
+│   │   ├── pulsar.py          # portable model → Pulsar tenants/namespaces/topics/policies
+│   │   └── kafka.py           # portable model → Kafka topics/configs/ACLs/consumer groups
+│   ├── engine/                # generic diff (desired vs live), plan, apply — backend-independent
 │   ├── stamps/                # stamp → backend → cluster resolution
 │   ├── monitors/              # Datadog monitor generation
 │   └── migrate/               # convert legacy gala-pulsar-env-deployment configs
-├── datadog/                   # monitor templates and per-environment thresholds
+├── datadog/                   # monitor templates per protocol (pulsar/, kafka/) + per-env thresholds
 ├── .github/
 │   ├── workflows/             # validate.yml (PR), plan.yml (PR comment), deploy.yml (gated promotion)
 │   └── CODEOWNERS             # generated from tenant configs + platform/ ownership
@@ -39,11 +43,84 @@ messaging-demo/
 
 - **Stamp** — data-residency zone (`us`, `eu`); the only location concept tenants declare.
   **Region** means a cloud region (`us-east-2`, `eu-central-1`) and is resolved by the platform.
-- **Backend** — messaging platform/version (`pulsar-4x`, `pulsar-5x`); hidden from tenants.
+- **Protocol** — the client wire protocol a tenant codes against (`pulsar`, `kafka`). Declared by the
+  tenant, because application SDKs are protocol-specific and cannot be swapped transparently.
+- **Backend** — a concrete deployment of a protocol (`pulsar-4x`, `pulsar-5x`, `msk-3x`,
+  `eventhubs-kafka`); version, vendor and cloud are hidden from tenants.
 - **Single branch (`main`)** — environments (`dev` → `qa` → `stage` → `prod`) are promoted via
   gated GitHub Environments, dispatched with independent `stamp` and `target_env` inputs.
 - **Plan/apply** — every change is diffed against live cluster state before it is applied.
 - **Monitors** — created per environment right after each deploy; `contacts.oncall` is required.
+
+## Backend abstraction
+
+The repo must serve teams on Pulsar, Kafka, or any future messaging platform without changing
+the tenant config format or the engine. The design has four layers:
+
+```
+tenants/<t>/config.yml        portable model (protocol-neutral names and units)
+        │  validate: schema + capability check against the tenant's protocol
+        ▼
+backends/<protocol>.py        translate desired config → native resources
+        │  read live state → same native resource shape
+        ▼
+engine/                       generic diff by (kind, key, spec) → plan.json
+        ▼
+backends/<protocol>.py        apply each change via the native admin API
+```
+
+### 1. Portable config model
+
+Tenant configs use neutral concepts, names and units:
+
+| Portable concept | Pulsar | Kafka |
+|---|---|---|
+| `tenant` | tenant | topic-name prefix + ACL principal scope |
+| `namespace` | namespace | topic-name prefix `<tenant>.<namespace>.`; namespace settings become per-topic defaults |
+| `topic` | `persistent://<tenant>/<namespace>/<topic>` | topic `<tenant>.<namespace>.<topic>` |
+| `partitions` | partitioned topic | partitions |
+| `retention: {time, size}` | retention policy (minutes / MB) | `retention.ms` / `retention.bytes` |
+| `max_message_size` | `maxMessageSize` | `max.message.bytes` |
+| `subscriptions` | subscription | consumer group (+ READ ACL on group) |
+| `permissions.produce/consume` | namespace `grant-permission` | PREFIXED ACLs (WRITE / READ) |
+| `schema: {type, compatibility}` | schema registry on topic | Schema Registry subject `<topic>-value` |
+
+Units are human-readable (`7d`, `2GiB`) and converted by each adapter.
+
+### 2. Capabilities, not lowest common denominator
+
+Each backend declares the optional features it supports (e.g. `ttl`, `delayed_delivery`,
+`dispatch_rate` for Pulsar; `compaction` for Kafka). `validate` rejects a tenant config that uses a
+feature its protocol does not support — so portable configs never silently lose settings.
+
+### 3. Native escape hatch
+
+Settings with no portable equivalent go under `native.<protocol>` on a namespace or topic. They are
+passed through untouched by the engine, validated by that protocol's adapter, and ignored by others:
+
+```yaml
+topics:
+  orders:
+    partitions: 3
+    retention: { time: 7d }
+    native:
+      pulsar: { isGlobal: true }
+```
+
+If the same `native` setting appears in many tenants, promote it to the portable model.
+
+### 4. Routing by protocol
+
+Tenants declare `protocol` and `stamps`; `platform/stamps.yml` resolves them to backends and clusters.
+A new platform (e.g. Event Hubs via its Kafka endpoint, or Pulsar 5.x) is added by registering a
+backend under the right protocol — no tenant config changes. A new *protocol* (e.g. RabbitMQ/AMQP) is
+added by writing one adapter in `backends/` and one monitor template set in `datadog/`.
+
+### Monitors
+
+Monitor kinds are portable (`backlog`/`lag`, `no_consumers`, `publish_absent`, `error_rate`);
+`datadog/<protocol>/` maps each kind to that protocol's metrics (e.g. `pulsar.msg_backlog` vs.
+`kafka.consumer_lag`).
 
 ## Out of scope
 
@@ -58,7 +135,8 @@ zero-diff migration gate, stamps) but proposes the following adjustments:
 - **Evaluate buy vs. build before writing a custom plan/apply engine.** Compare
   `streamnative/terraform-provider-pulsar` and the StreamNative `pulsar-resources-operator`
   (GitOps via ArgoCD) against a bespoke CLI. Custom code may only be needed for orphan
-  detection and cross-backend equivalence checks.
+  detection and cross-backend equivalence checks. Terraform has providers for both Pulsar and
+  Kafka, so adapters could emit Terraform instead of calling admin APIs directly.
 - **Generate the JSON Schema from the Pydantic models** (`model_json_schema()`) instead of maintaining both.
 - **`apply` rejects stale plans** (hash of live state embedded in `plan.json`) rather than defaulting to dry-run.
 
@@ -71,8 +149,14 @@ zero-diff migration gate, stamps) but proposes the following adjustments:
   `cfs-pulsar-infra` Helm values, before dumping every topic.
 
 ### Backend abstraction
-- **Be honest that the tenant config is Pulsar-shaped.** Keep abstraction at the
-  stamp → backend → cluster routing layer (needed for 4.x → 5.x); defer Kafka until it is a real requirement.
+- **Make the abstraction real, not just naming.** The roadmap's sample config uses Pulsar-only
+  fields (`maxProducersPerTopic`, `subscription_auth_mode`, `encryption_required`), so it is not
+  actually backend-agnostic. Adopt the portable model + capability check + `native.<protocol>`
+  escape hatch + per-protocol adapters described in [Backend abstraction](#backend-abstraction).
+- **Tenants declare `protocol`** (`pulsar` / `kafka`). Client SDKs are protocol-specific, so the
+  protocol can't be hidden; version, vendor and cloud still are.
+- **Diff in native terms, generically.** Adapters translate both desired and live state into the
+  same `(kind, key, spec)` resources, so `engine/` has no protocol-specific code.
 - **Describe multi-backend apply as "partial failure reported"**, not atomic.
 
 ### Config format
